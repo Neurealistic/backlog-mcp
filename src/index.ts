@@ -24,14 +24,34 @@ import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import express from 'express';
 import { randomUUID } from 'node:crypto';
-import { readFileSync, writeFileSync, existsSync, readdirSync, unlinkSync, openSync, closeSync, statSync } from 'node:fs';
-import { join, resolve } from 'node:path';
+import { readFileSync, writeFileSync, existsSync, readdirSync, unlinkSync, openSync, closeSync, statSync, mkdirSync } from 'node:fs';
+import { join, resolve, dirname } from 'node:path';
+import { homedir } from 'node:os';
 import { z } from 'zod';
+
+// ── Home (persisted default backlog dir) ─────────────────────────────────────
+// Resolution order: explicit `dir` param → persisted home (set_home) → $BACKLOG_DIR → <cwd>/backlog.
+// The home is stored per-user so a fresh stdio spawn keeps it; explicit `dir` still overrides per call
+// (multi-backlog use — e.g. a TASK-* and a CEN-* backlog — stays supported).
+
+function configPath(): string {
+  return process.env.BACKLOG_MCP_CONFIG ?? join(homedir(), '.config', 'backlog-mcp', 'config.json');
+}
+function readHome(): string | undefined {
+  try { const h = JSON.parse(readFileSync(configPath(), 'utf8')).home; return h ? String(h) : undefined; } catch { return undefined; }
+}
+function writeHome(path: string): string {
+  const home = resolve(path);
+  const cfg = configPath();
+  mkdirSync(dirname(cfg), { recursive: true });
+  writeFileSync(cfg, JSON.stringify({ home }, null, 2));
+  return home;
+}
 
 // ── Backlog dir + config ─────────────────────────────────────────────────────
 
 function backlogDir(dir?: string): string {
-  return resolve(dir ?? process.env.BACKLOG_DIR ?? join(process.cwd(), 'backlog'));
+  return resolve(dir ?? readHome() ?? process.env.BACKLOG_DIR ?? join(process.cwd(), 'backlog'));
 }
 function tasksDir(dir?: string): string {
   return join(backlogDir(dir), 'tasks');
@@ -214,7 +234,7 @@ function now(): string {
 
 // ── MCP tools ────────────────────────────────────────────────────────────────
 
-const server = new McpServer({ name: 'backlog', version: '0.1.0' });
+const server = new McpServer({ name: 'backlog', version: '0.2.0' });
 const ok = (o: unknown) => ({ content: [{ type: 'text' as const, text: typeof o === 'string' ? o : JSON.stringify(o, null, 2) }] });
 const err = (m: string) => ({ isError: true, content: [{ type: 'text' as const, text: m }] });
 const summary = (t: Task) => ({ id: t.id, title: t.title, status: t.status, labels: t.labels, acDone: t.ac.filter((a) => a.checked).length, acTotal: t.ac.length });
@@ -309,6 +329,27 @@ server.tool('task_delete', 'Delete a task file (destructive).', {
       return { deleted: id };
     }));
   } catch (e: any) { return err(String(e?.message ?? e)); }
+});
+
+server.tool('set_home', 'Set the DEFAULT backlog dir (persisted per-user), so later calls need no `dir`. Explicit `dir` still overrides per call. Optionally init the dir (create tasks/ + config.yml) when it is empty.', {
+  path: z.string().describe('absolute path to the backlog dir — the folder that contains (or will contain) tasks/'),
+  init: z.boolean().optional().describe('create tasks/ + a default config.yml if missing'),
+  prefix: z.string().optional().describe('task id prefix when init-ing a fresh backlog, e.g. TASK'),
+}, async ({ path, init, prefix }) => {
+  try {
+    const home = writeHome(path);
+    if (init) {
+      mkdirSync(join(home, 'tasks'), { recursive: true });
+      const cfg = join(home, 'config.yml');
+      if (!existsSync(cfg)) writeFileSync(cfg, `task_prefix: "${prefix ?? 'TASK'}"\ndefault_status: "To Do"\nstatuses: ["To Do", "In Progress", "Done"]\n`);
+    }
+    return ok({ home, tasksDir: existsSync(join(home, 'tasks')), config: existsSync(join(home, 'config.yml')), note: 'later task_* calls default here; pass `dir` to override' });
+  } catch (e: any) { return err(String(e?.message ?? e)); }
+});
+
+server.tool('get_home', 'Show the current default backlog dir and how it was resolved.', {}, async () => {
+  const home = readHome();
+  return ok({ home: home ?? null, resolved: backlogDir(), source: home ? 'set_home' : (process.env.BACKLOG_DIR ? 'BACKLOG_DIR' : 'cwd/backlog'), config: configPath() });
 });
 
 // ── Transport ────────────────────────────────────────────────────────────────

@@ -46,14 +46,18 @@ Register it in an MCP client (`.mcp.json`):
 
 ## Backlog directory
 
-Resolved per call as: the tool's `dir` param → `$BACKLOG_DIR` → `<cwd>/backlog`. One server can serve
-several backlogs (e.g. a workspace `TASK-*` and a project `CEN-*`) — the id prefix comes from each
-dir's `config.yml` (`task_prefix`).
+Resolved per call as: the tool's `dir` param → **persisted home** (`set_home`) → `$BACKLOG_DIR` →
+`<cwd>/backlog`. Call `set_home` once and later calls need no `dir`; an explicit `dir` still overrides
+per call, so one server can serve several backlogs (e.g. a workspace `TASK-*` and a project `CEN-*`) —
+the id prefix comes from each dir's `config.yml` (`task_prefix`). The home is stored per-user at
+`$BACKLOG_MCP_CONFIG` (default `~/.config/backlog-mcp/config.json`).
 
 ## Tools
 
 | Tool | Description |
 |------|-------------|
+| `set_home` | Set the default backlog dir (persisted); optionally `init` an empty dir (creates `tasks/` + `config.yml`). |
+| `get_home` | Show the current default backlog dir + how it was resolved. |
 | `task_list` | List tasks (id, title, status, labels, AC progress); optional status filter. |
 | `task_get` | Read one task in full (frontmatter + AC + plan + notes). |
 | `task_create` | Create a task with an atomic collision-safe id (never overwrites). |
