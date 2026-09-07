@@ -27,7 +27,18 @@ import { randomUUID } from 'node:crypto';
 import { readFileSync, writeFileSync, existsSync, readdirSync, unlinkSync, openSync, closeSync, statSync, mkdirSync } from 'node:fs';
 import { join, resolve, dirname } from 'node:path';
 import { homedir } from 'node:os';
+import { execFileSync } from 'node:child_process';
 import { z } from 'zod';
+
+// ── Jira-like model constants ────────────────────────────────────────────────
+const ISSUE_TYPES = ['epic', 'story', 'task', 'subtask', 'bug'] as const;
+const LINK_TYPES = ['blocks', 'blocked-by', 'relates', 'duplicates', 'duplicated-by'] as const;
+// Inverse of each link type, so a link is maintained on BOTH tasks (A blocks B ⇒ B blocked-by A).
+const LINK_INVERSE: Record<string, string> = {
+  blocks: 'blocked-by', 'blocked-by': 'blocks',
+  relates: 'relates',
+  duplicates: 'duplicated-by', 'duplicated-by': 'duplicates',
+};
 
 // ── Home (persisted default backlog dir) ─────────────────────────────────────
 // Resolution order: explicit `dir` param → persisted home (set_home) → $BACKLOG_DIR → <cwd>/backlog.
@@ -75,9 +86,16 @@ interface Task {
   id: string;
   title: string;
   status: string;
+  type: string;        // Jira-like issue type: epic|story|task|subtask|bug (default 'task')
+  parent: string;      // parent task id ('' = none) — epic⊃story⊃task⊃subtask
+  reporter: string;    // who filed it ('' = none)
+  priority: string;    // e.g. highest|high|medium|low ('' = none)
   assignee: string[];
   labels: string[];
   dependencies: string[];
+  links: Array<{ type: string; target: string }>; // typed cross-links (blocks/relates/duplicates…)
+  dev: string[];       // git/pr dev-panel refs (branch:… / commit:… / pr:… / merged:…)
+  qmetry: string[];    // qmetry refs (suite:… / run:…:result)
   ordinal: number;
   created: string;
   updated: string;
@@ -153,26 +171,35 @@ function parseTask(file: string): Task {
   const fm = parseFrontmatter(raw);
   return {
     id: fm.id ?? '', title: fm.title ?? '', status: fm.status ?? '',
+    type: (fm.type ?? 'task').toLowerCase(), parent: fm.parent ?? '', reporter: fm.reporter ?? '', priority: fm.priority ?? '',
     assignee: parseList(raw, 'assignee'), labels: parseList(raw, 'labels'), dependencies: parseList(raw, 'dependencies'),
+    links: parseList(raw, 'links').map((s) => { const i = s.indexOf(':'); return i < 0 ? { type: 'relates', target: s.toUpperCase() } : { type: s.slice(0, i).trim(), target: s.slice(i + 1).trim().toUpperCase() }; }),
+    dev: parseList(raw, 'dev'), qmetry: parseList(raw, 'qmetry'),
     ordinal: Number(fm.ordinal ?? 0), created: fm.created_date ?? '', updated: fm.updated_date ?? '',
     ac: parseAc(raw), plan: between(raw, PLAN_BEGIN, PLAN_END), notes: between(raw, NOTES_BEGIN, NOTES_END), file,
   };
 }
 
 function renderTask(t: Omit<Task, 'file'>): string {
-  const fm = [
+  const listBlock = (key: string, items: string[]) => `${key}: ${items.length ? '\n' + items.map((x) => `  - ${yamlScalar(x)}`).join('\n') : '[]'}`;
+  const lines = [
     '---',
     `id: ${t.id}`,
     `title: ${yamlScalar(t.title)}`,
     `status: ${yamlScalar(t.status)}`,
-    `assignee: ${t.assignee.length ? '\n' + t.assignee.map((a) => `  - ${yamlScalar(a)}`).join('\n') : '[]'}`,
-    `created_date: '${t.created}'`,
-    `updated_date: '${t.updated}'`,
-    `labels: ${t.labels.length ? '\n' + t.labels.map((l) => `  - ${yamlScalar(l)}`).join('\n') : '[]'}`,
-    `dependencies: ${t.dependencies.length ? '\n' + t.dependencies.map((d) => `  - ${yamlScalar(d)}`).join('\n') : '[]'}`,
-    `ordinal: ${t.ordinal}`,
-    '---',
-  ].join('\n');
+    `type: ${t.type || 'task'}`,
+  ];
+  if (t.parent) lines.push(`parent: ${t.parent}`);
+  if (t.reporter) lines.push(`reporter: ${yamlScalar(t.reporter)}`);
+  if (t.priority) lines.push(`priority: ${yamlScalar(t.priority)}`);
+  lines.push(listBlock('assignee', t.assignee));
+  lines.push(`created_date: '${t.created}'`, `updated_date: '${t.updated}'`);
+  lines.push(listBlock('labels', t.labels), listBlock('dependencies', t.dependencies));
+  if (t.links.length) lines.push(listBlock('links', t.links.map((l) => `${l.type}:${l.target}`)));
+  if (t.dev.length) lines.push(listBlock('dev', t.dev));
+  if (t.qmetry.length) lines.push(listBlock('qmetry', t.qmetry));
+  lines.push(`ordinal: ${t.ordinal}`, '---');
+  const fm = lines.join('\n');
   const ac = t.ac.length
     ? t.ac.map((a, i) => `- [${a.checked ? 'x' : ' '}] #${i + 1} ${a.text}`).join('\n')
     : '';
@@ -234,17 +261,29 @@ function now(): string {
 
 // ── MCP tools ────────────────────────────────────────────────────────────────
 
-const server = new McpServer({ name: 'backlog', version: '0.2.0' });
+const server = new McpServer({ name: 'backlog', version: '0.3.0' });
 const ok = (o: unknown) => ({ content: [{ type: 'text' as const, text: typeof o === 'string' ? o : JSON.stringify(o, null, 2) }] });
 const err = (m: string) => ({ isError: true, content: [{ type: 'text' as const, text: m }] });
-const summary = (t: Task) => ({ id: t.id, title: t.title, status: t.status, labels: t.labels, acDone: t.ac.filter((a) => a.checked).length, acTotal: t.ac.length });
+const summary = (t: Task) => ({
+  id: t.id, type: t.type, title: t.title, status: t.status,
+  ...(t.parent ? { parent: t.parent } : {}), ...(t.priority ? { priority: t.priority } : {}),
+  labels: t.labels, acDone: t.ac.filter((a) => a.checked).length, acTotal: t.ac.length,
+});
 
-server.tool('task_list', 'List backlog tasks (id, title, status, labels, AC progress). Optional status filter.', {
+server.tool('task_list', 'List backlog tasks (id, type, title, status, parent, labels, AC progress). Optional filters: status, type, parent, assignee, label.', {
   dir: z.string().optional().describe('backlog dir; default $BACKLOG_DIR or <cwd>/backlog'),
   status: z.string().optional().describe('filter by exact status, e.g. "In Progress"'),
-}, async ({ dir, status }) => {
+  type: z.enum(ISSUE_TYPES).optional().describe('filter by issue type'),
+  parent: z.string().optional().describe('filter to direct children of this parent id'),
+  assignee: z.string().optional().describe('filter to tasks assigned to this name'),
+  label: z.string().optional().describe('filter to tasks carrying this label'),
+}, async ({ dir, status, type, parent, assignee, label }) => {
   let tasks = listFiles(dir).map(parseTask);
   if (status) tasks = tasks.filter((t) => t.status.toLowerCase() === status.toLowerCase());
+  if (type) tasks = tasks.filter((t) => t.type === type);
+  if (parent) tasks = tasks.filter((t) => t.parent.toUpperCase() === parent.toUpperCase());
+  if (assignee) tasks = tasks.filter((t) => t.assignee.some((a) => a.toLowerCase() === assignee.toLowerCase()));
+  if (label) tasks = tasks.filter((t) => t.labels.some((l) => l.toLowerCase() === label.toLowerCase()));
   tasks.sort((a, b) => a.ordinal - b.ordinal);
   return ok(tasks.map(summary));
 });
@@ -255,15 +294,25 @@ server.tool('task_get', 'Read one task in full (frontmatter + acceptance criteri
 }, async ({ id, dir }) => {
   const f = findFileById(id, dir); if (!f) return err(`no task ${id}`);
   const t = parseTask(f);
-  return ok({ ...summary(t), assignee: t.assignee, created: t.created, updated: t.updated, ac: t.ac, plan: t.plan, notes: t.notes, file: t.file });
+  const children = listFiles(dir).map(parseTask).filter((c) => c.parent.toUpperCase() === t.id.toUpperCase()).map((c) => c.id);
+  return ok({
+    ...summary(t), reporter: t.reporter || undefined, assignee: t.assignee,
+    links: t.links, children, dev: t.dev, qmetry: t.qmetry,
+    created: t.created, updated: t.updated, ac: t.ac, plan: t.plan, notes: t.notes, file: t.file,
+  });
 });
 
-server.tool('task_create', 'Create a task with an ATOMIC collision-safe id (never overwrites). Structured params — no shell escaping.', {
+server.tool('task_create', 'Create a task with an ATOMIC collision-safe id (never overwrites). Structured params — no shell escaping. Supports Jira-like type/parent/reporter/priority/assignee.', {
   title: z.string().describe('task title'),
+  type: z.enum(ISSUE_TYPES).optional().describe('issue type (default task): epic|story|task|subtask|bug'),
+  parent: z.string().optional().describe('parent task id (epic⊃story⊃task⊃subtask) — must exist'),
   acceptanceCriteria: z.array(z.string()).optional().describe('acceptance criteria, one requirement each'),
   plan: z.string().optional(),
   notes: z.string().optional(),
   labels: z.array(z.string()).optional(),
+  assignee: z.array(z.string()).optional().describe('assignees (agent/human names)'),
+  reporter: z.string().optional().describe('who filed it'),
+  priority: z.string().optional().describe('highest|high|medium|low'),
   status: z.string().optional().describe('default = the backlog default status'),
   dir: z.string().optional(),
 }, async (p) => {
@@ -273,17 +322,21 @@ server.tool('task_create', 'Create a task with an ATOMIC collision-safe id (neve
 /** Allocate an id and write a new task — the whole thing under the dir lock so concurrent
  *  creates can never collide. `wx` on the write is the final guard against ever clobbering. */
 export async function createTask(p: {
-  title: string; acceptanceCriteria?: string[]; plan?: string; notes?: string; labels?: string[]; status?: string; dir?: string;
+  title: string; type?: string; parent?: string; acceptanceCriteria?: string[]; plan?: string; notes?: string;
+  labels?: string[]; assignee?: string[]; reporter?: string; priority?: string; status?: string; dir?: string;
 }): Promise<{ created: string; file: string }> {
   const { dir } = p;
   return withLock(dir, () => {
+    if (p.parent && !findFileById(p.parent, dir)) throw new Error(`parent ${p.parent} does not exist`);
     const { id, num } = nextId(dir); // allocated INSIDE the lock → race-free
     const file = join(tasksDir(dir), `${id.toLowerCase()} - ${slug(p.title)}.md`);
     if (allIds(dir).has(id) || existsSync(file)) throw new Error(`id ${id} would collide — aborted`);
     const cfg = readConfig(dir);
     const ts = now();
     const task: Omit<Task, 'file'> = {
-      id, title: p.title, status: p.status ?? cfg.defaultStatus, assignee: [], labels: p.labels ?? [], dependencies: [],
+      id, title: p.title, status: p.status ?? cfg.defaultStatus,
+      type: (p.type ?? 'task').toLowerCase(), parent: (p.parent ?? '').toUpperCase(), reporter: p.reporter ?? '', priority: p.priority ?? '',
+      assignee: p.assignee ?? [], labels: p.labels ?? [], dependencies: [], links: [], dev: [], qmetry: [],
       ordinal: num * 1000, created: ts, updated: ts,
       ac: (p.acceptanceCriteria ?? []).map((text) => ({ checked: false, text })), plan: p.plan ?? '', notes: p.notes ?? '',
     };
@@ -292,21 +345,44 @@ export async function createTask(p: {
   });
 }
 
-server.tool('task_update', 'Update a task: status, plan, notes (replace), append a comment to notes, or check/uncheck an AC by number.', {
+server.tool('task_update', 'Update a task: status/type/parent/reporter/priority/assignee/labels, plan/notes (replace), append a comment, or check/uncheck an AC. Set parent to "" to clear it.', {
   id: z.string(),
   status: z.string().optional(),
+  type: z.enum(ISSUE_TYPES).optional(),
+  parent: z.string().optional().describe('parent id (must exist, no cycles); "" clears it'),
+  reporter: z.string().optional(),
+  priority: z.string().optional(),
+  assignee: z.array(z.string()).optional().describe('REPLACES the assignee list'),
+  labels: z.array(z.string()).optional().describe('REPLACES the labels list'),
   plan: z.string().optional().describe('REPLACES the plan section'),
   notes: z.string().optional().describe('REPLACES the notes section'),
   comment: z.string().optional().describe('APPENDS a timestamped line to the notes section'),
   checkAc: z.number().optional().describe('1-based AC number to mark done'),
   uncheckAc: z.number().optional().describe('1-based AC number to mark not-done'),
   dir: z.string().optional(),
-}, async ({ id, status, plan, notes, comment, checkAc, uncheckAc, dir }) => {
+}, async ({ id, status, type, parent, reporter, priority, assignee, labels, plan, notes, comment, checkAc, uncheckAc, dir }) => {
   try {
     return ok(await withLock(dir, () => {
       const f = findFileById(id, dir); if (!f) throw new Error(`no task ${id}`);
       const t = parseTask(f);
       if (status) t.status = status;
+      if (type) t.type = type.toLowerCase();
+      if (parent !== undefined) {
+        if (parent === '') t.parent = '';
+        else {
+          const pid = parent.toUpperCase();
+          if (pid === t.id.toUpperCase()) throw new Error('a task cannot be its own parent');
+          if (!findFileById(pid, dir)) throw new Error(`parent ${pid} does not exist`);
+          // walk the parent chain to reject a cycle
+          let cur: string | undefined = pid, guard = 0;
+          while (cur && guard++ < 100) { if (cur.toUpperCase() === t.id.toUpperCase()) throw new Error('parent would create a cycle'); const pf = findFileById(cur, dir); cur = pf ? (parseTask(pf).parent || undefined) : undefined; }
+          t.parent = pid;
+        }
+      }
+      if (reporter !== undefined) t.reporter = reporter;
+      if (priority !== undefined) t.priority = priority;
+      if (assignee !== undefined) t.assignee = assignee;
+      if (labels !== undefined) t.labels = labels;
       if (plan !== undefined) t.plan = plan;
       if (notes !== undefined) t.notes = notes;
       if (comment) t.notes = (t.notes ? t.notes + '\n\n' : '') + `> [${now()}] ${comment}`;
@@ -329,6 +405,90 @@ server.tool('task_delete', 'Delete a task file (destructive).', {
       return { deleted: id };
     }));
   } catch (e: any) { return err(String(e?.message ?? e)); }
+});
+
+server.tool('task_link', 'Link two tasks with a typed relationship (blocks/blocked-by/relates/duplicates/duplicated-by). Maintains the INVERSE on the other task automatically. Set remove=true to unlink both sides.', {
+  id: z.string(),
+  type: z.enum(LINK_TYPES),
+  target: z.string().describe('the other task id'),
+  remove: z.boolean().optional(),
+  dir: z.string().optional(),
+}, async ({ id, type, target, remove, dir }) => {
+  try {
+    return ok(await withLock(dir, () => {
+      const fa = findFileById(id, dir); if (!fa) throw new Error(`no task ${id}`);
+      const fb = findFileById(target, dir); if (!fb) throw new Error(`no task ${target}`);
+      const a = parseTask(fa), b = parseTask(fb);
+      if (a.id.toUpperCase() === b.id.toUpperCase()) throw new Error('cannot link a task to itself');
+      const inv = LINK_INVERSE[type] ?? 'relates';
+      const srcU = a.id.toUpperCase(), tgtU = b.id.toUpperCase();
+      const has = (t: Task, ty: string, tg: string) => t.links.some((l) => l.type === ty && l.target.toUpperCase() === tg);
+      if (remove) {
+        a.links = a.links.filter((l) => !(l.type === type && l.target.toUpperCase() === tgtU));
+        b.links = b.links.filter((l) => !(l.type === inv && l.target.toUpperCase() === srcU));
+      } else {
+        if (!has(a, type, tgtU)) a.links.push({ type, target: b.id });
+        if (!has(b, inv, srcU)) b.links.push({ type: inv, target: a.id });
+      }
+      a.updated = now(); b.updated = now();
+      writeFileSync(fa, renderTask(a)); writeFileSync(fb, renderTask(b));
+      return { [a.id]: a.links, [b.id]: b.links };
+    }));
+  } catch (e: any) { return err(String(e?.message ?? e)); }
+});
+
+server.tool('task_dev_scan', 'Dev-panel: scan a git repo for this task id in branch names + commit messages (Smart-Commit convention, e.g. a branch `CEN-12-…` or a commit mentioning CEN-12) and report branches/commits/merged. Optionally persist into the task dev: field.', {
+  id: z.string(),
+  repo: z.string().describe('absolute path to the git repo to scan'),
+  persist: z.boolean().optional().describe('write the findings into the task dev: field'),
+  dir: z.string().optional(),
+}, async ({ id, repo, persist, dir }) => {
+  try {
+    const f = findFileById(id, dir); if (!f) return err(`no task ${id}`);
+    const git = (args: string[]) => { try { return execFileSync('git', ['-C', repo, ...args], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] }).trim(); } catch { return ''; } };
+    const idU = id.toUpperCase();
+    const branches = git(['branch', '-a', '--format=%(refname:short)']).split('\n').filter((b) => b && b.toUpperCase().includes(idU));
+    const commits = git(['log', '--all', `--grep=${idU}`, '-i', '--oneline', '-n', '50']).split('\n').filter(Boolean);
+    const base = git(['symbolic-ref', '--short', 'refs/remotes/origin/HEAD']).replace(/^origin\//, '') || 'main';
+    const mergedSet = new Set(git(['branch', '-a', '--merged', base, '--format=%(refname:short)']).split('\n').filter(Boolean));
+    const merged = branches.filter((b) => mergedSet.has(b));
+    const dev = [...branches.map((b) => `branch:${b}`), ...commits.slice(0, 20).map((c) => `commit:${c}`), ...merged.map((b) => `merged:${b}`)];
+    if (persist) await withLock(dir, () => { const t = parseTask(f); t.dev = dev; t.updated = now(); writeFileSync(f, renderTask(t)); });
+    return ok({ id: idU, repo, branches, commits, mergedBranches: merged, persisted: !!persist });
+  } catch (e: any) { return err(String(e?.message ?? e)); }
+});
+
+server.tool('task_qmetry', 'Attach a QMetry reference to the task (a suite or a run, with an optional result). Passive ref stored in the task qmetry: field. Re-attaching the same id replaces it; remove=true detaches.', {
+  id: z.string(),
+  kind: z.enum(['suite', 'run']),
+  ref: z.string().describe('the QMetry id, e.g. a suite QS-12 or a run QR-88'),
+  result: z.string().optional().describe('for a run: passed|failed|blocked|…'),
+  remove: z.boolean().optional(),
+  dir: z.string().optional(),
+}, async ({ id, kind, ref, result, remove, dir }) => {
+  try {
+    return ok(await withLock(dir, () => {
+      const f = findFileById(id, dir); if (!f) throw new Error(`no task ${id}`);
+      const t = parseTask(f);
+      const key = `${kind}:${ref}`;
+      t.qmetry = t.qmetry.filter((q) => q !== key && !q.startsWith(key + ':'));
+      if (!remove) t.qmetry.push(`${key}${result ? ':' + result : ''}`);
+      t.updated = now(); writeFileSync(f, renderTask(t));
+      return { id: t.id, qmetry: t.qmetry };
+    }));
+  } catch (e: any) { return err(String(e?.message ?? e)); }
+});
+
+server.tool('task_tree', 'Show the parent/child hierarchy as a tree (epic⊃story⊃task⊃subtask). Optional root id; else all top-level (parentless) tasks.', {
+  root: z.string().optional(),
+  dir: z.string().optional(),
+}, async ({ root, dir }) => {
+  const tasks = listFiles(dir).map(parseTask);
+  const byParent = new Map<string, Task[]>();
+  for (const t of tasks) { const p = t.parent.toUpperCase(); if (!byParent.has(p)) byParent.set(p, []); byParent.get(p)!.push(t); }
+  const node = (t: Task): unknown => ({ id: t.id, type: t.type, title: t.title, status: t.status, children: (byParent.get(t.id.toUpperCase()) ?? []).sort((a, b) => a.ordinal - b.ordinal).map(node) });
+  if (root) { const f = findFileById(root, dir); if (!f) return err(`no task ${root}`); return ok(node(parseTask(f))); }
+  return ok(tasks.filter((t) => !t.parent).sort((a, b) => a.ordinal - b.ordinal).map(node));
 });
 
 server.tool('set_home', 'Set the DEFAULT backlog dir (persisted per-user), so later calls need no `dir`. Explicit `dir` still overrides per call. Optionally init the dir (create tasks/ + config.yml) when it is empty.', {
